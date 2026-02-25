@@ -3,10 +3,6 @@ sfxDesigner
 *.o
 *.exe
 
-# Build artifacts
-*.wav
-*.json
-
 #IDE Files
 .vscode/
 *.swp
