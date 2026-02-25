@@ -2,12 +2,20 @@ CXX := g++
 CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Isrc -Ithird_party/imgui -Ithird_party/imgui/backends
 LDFLAGS := -lGL -lglut
 
+HAVE_AUDIO_LIBS := $(shell pkg-config --exists aubio sndfile && echo 1 || echo 0)
+
+ifeq ($(HAVE_AUDIO_LIBS),1)
+CXXFLAGS += $(shell pkg-config --cflags aubio sndfile) -DUSE_AUBIO_SNDFILE
+LDFLAGS += $(shell pkg-config --libs aubio sndfile)
+endif
+
 TARGET := sfxDesigner
 SRC := \
 	src/main.cpp \
 	src/sfx_def.cpp \
 	src/synth_engine.cpp \
 	src/wav_writer.cpp \
+	src/audio_reader.cpp \
 	src/wav_reader.cpp \
 	src/sfx_importer.cpp \
 	src/json_exporter.cpp \

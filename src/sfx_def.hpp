@@ -28,6 +28,11 @@ struct SfxDef {
     float lp_filter_resonance = 0.0f;
     float hp_filter_cutoff = 0.0f;
     float phaser_offset = 0.0f;
+    float tonal_mix = 1.0f;
+    float noise_mix = 0.0f;
+    float noise_attack = 0.001f;
+    float noise_decay = 0.08f;
+    float noise_hp = 0.2f;
 };
 
 struct ParameterRange {
@@ -52,6 +57,11 @@ struct SfxParamRanges {
     ParameterRange lp_filter_resonance;
     ParameterRange hp_filter_cutoff;
     ParameterRange phaser_offset;
+    ParameterRange tonal_mix;
+    ParameterRange noise_mix;
+    ParameterRange noise_attack;
+    ParameterRange noise_decay;
+    ParameterRange noise_hp;
 };
 
 struct NamedPreset {

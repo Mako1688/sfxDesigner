@@ -51,12 +51,19 @@ std::vector<float> render_samples(const SfxDef& sfx, int sample_rate, float dura
     float hp_state = 0.0f;
     float prev_lp = 0.0f;
     float phaser_phase = 0.0f;
+    float noise_hp_state = 0.0f;
+    float noise_prev = 0.0f;
 
     const float vibrato_depth = std::max(0.0f, sfx.vibrato_depth);
     const float vibrato_speed = std::max(0.0f, sfx.vibrato_speed);
     const float lp_cutoff = clampf(sfx.lp_filter_cutoff, 0.01f, 1.0f);
     const float hp_cutoff = clampf(sfx.hp_filter_cutoff, 0.0f, 0.99f);
     const float resonance = clampf(sfx.lp_filter_resonance, 0.0f, 1.0f);
+    const float tonal_mix = clampf(sfx.tonal_mix, 0.0f, 1.0f);
+    const float noise_mix = clampf(sfx.noise_mix, 0.0f, 1.0f);
+    const float noise_attack = std::max(0.0f, sfx.noise_attack);
+    const float noise_decay = std::max(0.001f, sfx.noise_decay);
+    const float noise_hp = clampf(sfx.noise_hp, 0.0f, 0.99f);
 
     for (int i = 0; i < sample_count; ++i) {
         const float t = static_cast<float>(i) / static_cast<float>(sample_rate);
@@ -96,7 +103,21 @@ std::vector<float> render_samples(const SfxDef& sfx, int sample_rate, float dura
         phaser_phase += std::max(0.0f, sfx.phaser_offset) / static_cast<float>(sample_rate);
         const float phaser = std::sin(phaser_phase * 2.0f * kPi) * 0.2f;
 
-        float sample = (hp_state + phaser) * env;
+        float noise_env = 0.0f;
+        if (t < noise_attack) {
+            noise_env = t / std::max(0.0001f, noise_attack);
+        } else {
+            noise_env = std::exp(-(t - noise_attack) / noise_decay);
+        }
+        noise_env = clampf(noise_env, 0.0f, 1.0f);
+
+        const float white = (static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX)) * 2.0f - 1.0f;
+        const float hp_in = white - noise_prev;
+        noise_prev = white;
+        noise_hp_state += (hp_in - noise_hp_state) * (1.0f - noise_hp);
+        const float transient_layer = noise_hp_state * noise_env;
+
+        float sample = (hp_state + phaser) * env * tonal_mix + transient_layer * noise_mix;
         sample *= std::max(0.0f, 1.0f - normalized_t * 0.1f);
         sample = clampf(sample, -1.0f, 1.0f);
 

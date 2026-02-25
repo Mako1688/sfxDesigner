@@ -1,0 +1,20 @@
+{
+  "name": "soraatwod-punch-416719",
+  "wave_type": "SQUARE",
+  "base_freq": 581.909,
+  "freq_limit": 12,
+  "freq_slide": -1000,
+  "freq_delta_slide": 0,
+  "duty_cycle": 0.5,
+  "duty_sweep": 0,
+  "vibrato_depth": 0.103709,
+  "vibrato_speed": 6.98497,
+  "attack_time": 0.103445,
+  "sustain_time": 1.00114,
+  "decay_time": 0.320679,
+  "sustain_punch": 0.0875,
+  "lp_filter_cutoff": 0.414978,
+  "lp_filter_resonance": 0.715688,
+  "hp_filter_cutoff": 0.2,
+  "phaser_offset": -0.468257
+}

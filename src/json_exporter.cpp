@@ -26,7 +26,12 @@ bool write_sfx_json(const std::string& path, const std::string& name, const SfxD
     out << "  \"lp_filter_cutoff\": " << sfx.lp_filter_cutoff << ",\n";
     out << "  \"lp_filter_resonance\": " << sfx.lp_filter_resonance << ",\n";
     out << "  \"hp_filter_cutoff\": " << sfx.hp_filter_cutoff << ",\n";
-    out << "  \"phaser_offset\": " << sfx.phaser_offset << "\n";
+    out << "  \"phaser_offset\": " << sfx.phaser_offset << ",\n";
+    out << "  \"tonal_mix\": " << sfx.tonal_mix << ",\n";
+    out << "  \"noise_mix\": " << sfx.noise_mix << ",\n";
+    out << "  \"noise_attack\": " << sfx.noise_attack << ",\n";
+    out << "  \"noise_decay\": " << sfx.noise_decay << ",\n";
+    out << "  \"noise_hp\": " << sfx.noise_hp << "\n";
     out << "}\n";
 
     return out.good();

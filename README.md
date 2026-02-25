@@ -27,6 +27,12 @@ sudo apt-get update
 sudo apt-get install -y build-essential freeglut3-dev libgl1-mesa-dev
 ```
 
+Enhanced import fitting (recommended):
+
+```bash
+sudo apt-get install -y libaubio-dev libsndfile1-dev ffmpeg zenity
+```
+
 Vendor ImGui sources:
 
 ```bash
@@ -60,5 +66,13 @@ make
 - Playback uses `aplay` when available.
 - Exported files are written under `exports/`.
 - Use `Import WAV Path` + `Browse...` + `Import WAV/MP3 -> Fit SfxDef` to convert external audio into editable `SfxDef` values.
+- Use `Import Source Match` (single slider) to blend strong retro compression (0.0) vs more source-like/open timbre (1.0) during import.
+- Use `Import Fidelity Boost` to spend more import-time optimization effort matching source dynamics/tone more closely.
+- Import also auto-sets preview duration to the source clip length (capped) so A/B is closer to the original timing.
+- Use `Preview Mode` (`Fitted`, `Source`, `Blend`) to A/B your synthesized result against imported source audio.
+- Preview playback now auto-falls back across `aplay`, `ffplay`, and `cvlc`, and includes `Auto Gain` + `Preview Gain` controls for quiet imports.
+- Use `Layers` controls (`Tonal Mix`, `Noise Mix`, `Noise Attack`, `Noise Decay`, `Noise HP`) for less-retro, closer timbre shaping.
+- `Similarity Score` + spectral/envelope error metrics are shown after import to objectively track fit quality.
 - `zenity` enables GUI file browse on Linux, and `ffmpeg` enables MP3 conversion.
+- When `libaubio-dev` and `libsndfile1-dev` are installed, build auto-enables higher fidelity pitch/audio analysis for import fitting.
 - This is the first incremental implementation and is structured for fast iteration.

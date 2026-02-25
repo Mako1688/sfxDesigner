@@ -1,8 +1,8 @@
+#include "audio_reader.hpp"
 #include "json_exporter.hpp"
 #include "sfx_def.hpp"
 #include "sfx_importer.hpp"
 #include "synth_engine.hpp"
-#include "wav_reader.hpp"
 #include "wav_writer.hpp"
 
 #include "imgui.h"
@@ -13,12 +13,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -36,6 +38,17 @@ struct AppState {
     RenderDebugData debug_data;
     float ui_font_scale = kUiFontScale;
     std::string import_path = "";
+    float import_source_match = 0.85f;
+    float import_fidelity_boost = 0.7f;
+    int preview_mode = 0;
+    float preview_source_blend = 0.5f;
+    float preview_gain = 1.0f;
+    bool auto_gain = true;
+    bool has_imported_source = false;
+    std::vector<float> imported_source_44k;
+    float similarity_spectral = 0.0f;
+    float similarity_envelope = 0.0f;
+    float similarity_score = 0.0f;
 
     std::vector<SfxDef> undo_stack;
     std::vector<SfxDef> redo_stack;
@@ -50,7 +63,10 @@ struct AppState {
 
 AppState g_app;
 
-void push_history() {
+void update_similarity_metrics();
+std::string shell_quote(const std::string& value);
+
+void push_undo_history() {
     g_app.undo_stack.push_back(g_app.current);
     if (g_app.undo_stack.size() > 256) {
         g_app.undo_stack.erase(g_app.undo_stack.begin());
@@ -68,6 +84,212 @@ void push_history_state(const SfxDef& state) {
 
 void rerender_preview() {
     g_app.preview_samples = render_samples(g_app.current, kSampleRate, g_app.render_duration, &g_app.debug_data);
+    update_similarity_metrics();
+}
+
+std::vector<float> resample_linear(const std::vector<float>& input, int src_rate, int dst_rate) {
+    if (input.empty() || src_rate <= 0 || dst_rate <= 0) {
+        return {};
+    }
+    if (src_rate == dst_rate) {
+        return input;
+    }
+
+    const double ratio = static_cast<double>(dst_rate) / static_cast<double>(src_rate);
+    const size_t out_count = std::max<size_t>(1, static_cast<size_t>(std::llround(static_cast<double>(input.size()) * ratio)));
+    std::vector<float> out(out_count, 0.0f);
+
+    for (size_t i = 0; i < out_count; ++i) {
+        const double src_pos = static_cast<double>(i) / ratio;
+        const size_t i0 = static_cast<size_t>(std::floor(src_pos));
+        const size_t i1 = std::min(i0 + 1, input.size() - 1);
+        const float t = static_cast<float>(src_pos - static_cast<double>(i0));
+        const float a = input[std::min(i0, input.size() - 1)];
+        const float b = input[i1];
+        out[i] = a + (b - a) * t;
+    }
+    return out;
+}
+
+std::vector<float> make_source_preview_samples() {
+    const size_t target_count = static_cast<size_t>(std::max(1, static_cast<int>(g_app.render_duration * static_cast<float>(kSampleRate))));
+    std::vector<float> out(target_count, 0.0f);
+    if (!g_app.has_imported_source || g_app.imported_source_44k.empty()) {
+        return out;
+    }
+    const size_t copy_count = std::min(target_count, g_app.imported_source_44k.size());
+    std::copy_n(g_app.imported_source_44k.begin(), copy_count, out.begin());
+    return out;
+}
+
+std::vector<float> make_playback_samples() {
+    const std::vector<float> synth = g_app.preview_samples;
+    if (g_app.preview_mode == 0 || !g_app.has_imported_source) {
+        return synth;
+    }
+
+    std::vector<float> source = make_source_preview_samples();
+    if (g_app.preview_mode == 1) {
+        return source;
+    }
+
+    const float source_w = std::clamp(g_app.preview_source_blend, 0.0f, 1.0f);
+    const float synth_w = 1.0f - source_w;
+    const size_t count = std::max(synth.size(), source.size());
+    std::vector<float> mixed(count, 0.0f);
+
+    for (size_t i = 0; i < count; ++i) {
+        const float sv = i < synth.size() ? synth[i] : 0.0f;
+        const float rv = i < source.size() ? source[i] : 0.0f;
+        mixed[i] = std::clamp(sv * synth_w + rv * source_w, -1.0f, 1.0f);
+    }
+    return mixed;
+}
+
+float peak_abs_signal(const std::vector<float>& x) {
+    float peak = 0.0f;
+    for (float v : x) {
+        peak = std::max(peak, std::fabs(v));
+    }
+    return peak;
+}
+
+void apply_gain_inplace(std::vector<float>& x, float gain) {
+    for (float& v : x) {
+        v = std::clamp(v * gain, -1.0f, 1.0f);
+    }
+}
+
+bool play_wav_with_available_player(const std::string& wav_path, std::string& used_player) {
+    struct PlayerCmd {
+        const char* name;
+        const char* cmd;
+    };
+
+    const std::vector<PlayerCmd> players = {
+        {"aplay", "aplay -q "},
+        {"ffplay", "ffplay -nodisp -autoexit -loglevel quiet "},
+        {"cvlc", "cvlc --play-and-exit --quiet "}
+    };
+
+    for (const auto& player : players) {
+        std::ostringstream check;
+        check << "command -v " << player.name << " >/dev/null 2>&1";
+        if (std::system(check.str().c_str()) != 0) {
+            continue;
+        }
+
+        std::ostringstream run;
+        run << player.cmd << shell_quote(wav_path) << " >/dev/null 2>&1";
+        if (std::system(run.str().c_str()) == 0) {
+            used_player = player.name;
+            return true;
+        }
+    }
+
+    used_player.clear();
+    return false;
+}
+
+std::vector<float> compute_envelope(const std::vector<float>& x) {
+    std::vector<float> env(x.size(), 0.0f);
+    if (x.empty()) {
+        return env;
+    }
+    float follower = 0.0f;
+    for (size_t i = 0; i < x.size(); ++i) {
+        const float mag = std::fabs(x[i]);
+        const float c = (mag > follower) ? 0.25f : 0.03f;
+        follower = c * mag + (1.0f - c) * follower;
+        env[i] = follower;
+    }
+    return env;
+}
+
+std::vector<float> stft_band_frame(const std::vector<float>& x, size_t start, size_t end, int sample_rate) {
+    const int bands = 10;
+    std::vector<float> out(static_cast<size_t>(bands), 0.0f);
+    if (end <= start + 8 || sample_rate <= 0) {
+        return out;
+    }
+    const float min_f = 80.0f;
+    const float max_f = std::min(12000.0f, static_cast<float>(sample_rate) * 0.45f);
+    const size_t n = end - start;
+
+    for (int b = 0; b < bands; ++b) {
+        const float t = static_cast<float>(b) / static_cast<float>(bands - 1);
+        const float f = min_f * std::pow(max_f / min_f, t);
+        float re = 0.0f;
+        float im = 0.0f;
+        for (size_t i = 0; i < n; ++i) {
+            const float w = 0.5f - 0.5f * std::cos(2.0f * 3.14159265358979323846f * static_cast<float>(i) / static_cast<float>(n - 1));
+            const float ph = 2.0f * 3.14159265358979323846f * f * static_cast<float>(i) / static_cast<float>(sample_rate);
+            const float s = x[start + i] * w;
+            re += s * std::cos(ph);
+            im -= s * std::sin(ph);
+        }
+        out[static_cast<size_t>(b)] = std::sqrt(re * re + im * im) / std::max(1.0f, static_cast<float>(n));
+    }
+
+    float sum = 0.0f;
+    for (float v : out) {
+        sum += v;
+    }
+    if (sum > 1e-8f) {
+        for (float& v : out) {
+            v /= sum;
+        }
+    }
+    return out;
+}
+
+std::tuple<float, float, float> compute_similarity_metrics(const std::vector<float>& source, const std::vector<float>& fitted, int sample_rate) {
+    if (source.empty() || fitted.empty()) {
+        return {0.0f, 0.0f, 0.0f};
+    }
+
+    const size_t n = std::min(source.size(), fitted.size());
+    const std::vector<float> src_env = compute_envelope(source);
+    const std::vector<float> fit_env = compute_envelope(fitted);
+
+    float env_err = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        env_err += std::fabs(src_env[i] - fit_env[i]);
+    }
+    env_err /= static_cast<float>(n);
+
+    const size_t window = 1024;
+    const size_t hop = 512;
+    float spec_err = 0.0f;
+    int frames = 0;
+    for (size_t start = 0; start + window <= n; start += hop) {
+        const auto a = stft_band_frame(source, start, start + window, sample_rate);
+        const auto b = stft_band_frame(fitted, start, start + window, sample_rate);
+        for (size_t i = 0; i < a.size(); ++i) {
+            spec_err += std::fabs(a[i] - b[i]);
+        }
+        ++frames;
+    }
+    if (frames > 0) {
+        spec_err /= static_cast<float>(frames * 10);
+    }
+
+    const float score = std::clamp(100.0f * (1.0f - (spec_err * 2.4f + env_err * 1.6f)), 0.0f, 100.0f);
+    return {spec_err, env_err, score};
+}
+
+void update_similarity_metrics() {
+    if (!g_app.has_imported_source || g_app.imported_source_44k.empty() || g_app.preview_samples.empty()) {
+        g_app.similarity_spectral = 0.0f;
+        g_app.similarity_envelope = 0.0f;
+        g_app.similarity_score = 0.0f;
+        return;
+    }
+    const std::vector<float> source = make_source_preview_samples();
+    const auto m = compute_similarity_metrics(source, g_app.preview_samples, kSampleRate);
+    g_app.similarity_spectral = std::get<0>(m);
+    g_app.similarity_envelope = std::get<1>(m);
+    g_app.similarity_score = std::get<2>(m);
 }
 
 std::vector<float> downsample_for_plot(const std::vector<float>& source) {
@@ -84,7 +306,7 @@ std::vector<float> downsample_for_plot(const std::vector<float>& source) {
 
 void randomize_current() {
     const auto& ranges = sfx_param_ranges();
-    push_history();
+    push_undo_history();
     g_app.current.wave_type = static_cast<WaveType>(std::rand() % 4);
     auto randf = [](const ParameterRange& range) {
         const float t = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
@@ -106,6 +328,11 @@ void randomize_current() {
     g_app.current.lp_filter_resonance = randf(ranges.lp_filter_resonance);
     g_app.current.hp_filter_cutoff = randf(ranges.hp_filter_cutoff);
     g_app.current.phaser_offset = randf(ranges.phaser_offset);
+    g_app.current.tonal_mix = randf(ranges.tonal_mix);
+    g_app.current.noise_mix = randf(ranges.noise_mix);
+    g_app.current.noise_attack = randf(ranges.noise_attack);
+    g_app.current.noise_decay = randf(ranges.noise_decay);
+    g_app.current.noise_hp = randf(ranges.noise_hp);
     g_app.status = "Randomized";
     rerender_preview();
 }
@@ -138,12 +365,40 @@ void play_preview() {
     rerender_preview();
     std::filesystem::create_directories("exports");
     const std::string temp_wav = "exports/.preview.wav";
-    if (!write_wav_file(temp_wav, g_app.preview_samples, kSampleRate)) {
+    std::vector<float> playback = make_playback_samples();
+    const float raw_peak = peak_abs_signal(playback);
+    if (raw_peak < 1e-5f) {
+        g_app.status = "Preview is silent (very low fitted/source signal)";
+        return;
+    }
+
+    float gain = std::max(0.0f, g_app.preview_gain);
+    if (g_app.auto_gain) {
+        const float target_peak = 0.85f;
+        const float normalize = target_peak / std::max(1e-6f, raw_peak);
+        gain *= std::min(256.0f, normalize);
+
+        if (raw_peak < 0.02f) {
+            gain *= 2.0f;
+        }
+    }
+    apply_gain_inplace(playback, gain);
+
+    const float post_peak = peak_abs_signal(playback);
+    if (post_peak < 0.01f) {
+        g_app.status = "Preview too quiet after gain (increase Preview Gain)";
+        return;
+    }
+
+    if (!write_wav_file(temp_wav, playback, kSampleRate)) {
         g_app.status = "Failed to write preview WAV";
         return;
     }
-    int rc = std::system("command -v aplay >/dev/null 2>&1 && aplay -q exports/.preview.wav >/dev/null 2>&1");
-    g_app.status = (rc == 0) ? "Played preview" : "Preview WAV generated (aplay not available)";
+
+    std::string used_player;
+    const bool played = play_wav_with_available_player(temp_wav, used_player);
+    g_app.status = played ? ("Played preview (" + used_player + ")")
+                          : "Preview WAV generated (player failed/unavailable)";
 }
 
 void save_exports() {
@@ -286,7 +541,7 @@ void import_audio_to_sfx() {
 
     WavData wav;
     std::string error;
-    if (!read_wav_file(wav_path.string(), wav, error)) {
+    if (!read_audio_file_best_effort(wav_path.string(), wav, error)) {
         g_app.status = "Import failed: " + error;
         if (!temp_wav.empty()) {
             std::error_code remove_ec;
@@ -303,8 +558,13 @@ void import_audio_to_sfx() {
         return;
     }
 
-    push_history();
-    g_app.current = fit_sfx_from_samples(wav.samples, wav.sample_rate);
+    const float imported_duration = static_cast<float>(wav.samples.size()) / static_cast<float>(std::max(1, wav.sample_rate));
+    g_app.render_duration = std::clamp(imported_duration, 0.1f, 10.0f);
+    g_app.imported_source_44k = resample_linear(wav.samples, wav.sample_rate, kSampleRate);
+    g_app.has_imported_source = !g_app.imported_source_44k.empty();
+
+    push_undo_history();
+    g_app.current = fit_sfx_from_samples(wav.samples, wav.sample_rate, g_app.import_source_match, g_app.import_fidelity_boost);
 
     std::filesystem::path p(source_path);
     if (p.has_stem()) {
@@ -325,7 +585,7 @@ void load_selected_preset() {
         return;
     }
     g_app.selected_preset = std::clamp(g_app.selected_preset, 0, static_cast<int>(category.size()) - 1);
-    push_history();
+    push_undo_history();
     g_app.current = category[static_cast<size_t>(g_app.selected_preset)].value;
     g_app.current_name = category[static_cast<size_t>(g_app.selected_preset)].name;
     g_app.status = "Preset loaded";
@@ -379,7 +639,7 @@ bool combo_wave_with_history() {
     const char* labels[] = {"Square", "Sawtooth", "Sine", "Noise"};
     const bool changed = ImGui::Combo("Wave Type", &wave, labels, 4);
     if (changed && wave != before) {
-        push_history();
+        push_undo_history();
         g_app.current.wave_type = static_cast<WaveType>(wave);
     }
     return changed;
@@ -447,6 +707,13 @@ void draw_parameter_groups() {
     changed |= slider_with_history("Vibrato Depth", &g_app.current.vibrato_depth, ranges.vibrato_depth.min, ranges.vibrato_depth.max);
     changed |= slider_with_history("Vibrato Speed", &g_app.current.vibrato_speed, ranges.vibrato_speed.min, ranges.vibrato_speed.max);
 
+    ImGui::SeparatorText("Layers");
+    changed |= slider_with_history("Tonal Mix", &g_app.current.tonal_mix, ranges.tonal_mix.min, ranges.tonal_mix.max);
+    changed |= slider_with_history("Noise Mix", &g_app.current.noise_mix, ranges.noise_mix.min, ranges.noise_mix.max);
+    changed |= slider_with_history("Noise Attack", &g_app.current.noise_attack, ranges.noise_attack.min, ranges.noise_attack.max);
+    changed |= slider_with_history("Noise Decay", &g_app.current.noise_decay, ranges.noise_decay.min, ranges.noise_decay.max);
+    changed |= slider_with_history("Noise HP", &g_app.current.noise_hp, ranges.noise_hp.min, ranges.noise_hp.max);
+
     if (changed) {
         rerender_preview();
     }
@@ -468,6 +735,12 @@ void draw_visualization() {
     }
     if (!wave_plot.empty()) {
         ImGui::PlotLines("Output", wave_plot.data(), static_cast<int>(wave_plot.size()), 0, nullptr, -1.0f, 1.0f, ImVec2(0, 90));
+    }
+
+    if (g_app.has_imported_source) {
+        ImGui::Text("Similarity Score: %.1f / 100", g_app.similarity_score);
+        ImGui::Text("Spectral Error: %.4f", g_app.similarity_spectral);
+        ImGui::Text("Envelope Error: %.4f", g_app.similarity_envelope);
     }
 }
 
@@ -498,12 +771,20 @@ void display_callback() {
         g_app.current_name = name_buf;
     }
 
-    if (ImGui::SliderFloat("WAV Duration (sec)", &g_app.render_duration, 0.1f, 5.0f)) {
+    if (ImGui::SliderFloat("WAV Duration (sec)", &g_app.render_duration, 0.1f, 10.0f)) {
         rerender_preview();
     }
     if (ImGui::SliderFloat("UI Scale", &g_app.ui_font_scale, 1.0f, 2.5f, "%.2fx")) {
         ImGui::GetIO().FontGlobalScale = g_app.ui_font_scale;
     }
+
+    const char* preview_modes[] = {"Fitted", "Source", "Blend"};
+    ImGui::Combo("Preview Mode", &g_app.preview_mode, preview_modes, 3);
+    if (g_app.preview_mode == 2) {
+        ImGui::SliderFloat("Preview Source Blend", &g_app.preview_source_blend, 0.0f, 1.0f, "%.2f");
+    }
+    ImGui::Checkbox("Auto Gain", &g_app.auto_gain);
+    ImGui::SliderFloat("Preview Gain", &g_app.preview_gain, 0.1f, 8.0f, "%.2fx");
 
     char import_buf[512];
     std::snprintf(import_buf, sizeof(import_buf), "%s", g_app.import_path.c_str());
@@ -514,6 +795,8 @@ void display_callback() {
     if (ImGui::Button("Browse...")) {
         browse_import_file();
     }
+    ImGui::SliderFloat("Import Source Match", &g_app.import_source_match, 0.0f, 1.0f, "%.2f");
+    ImGui::SliderFloat("Import Fidelity Boost", &g_app.import_fidelity_boost, 0.0f, 1.0f, "%.2f");
     if (ImGui::Button("Import WAV/MP3 -> Fit SfxDef")) {
         import_audio_to_sfx();
     }

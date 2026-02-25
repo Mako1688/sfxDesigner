@@ -4,4 +4,4 @@
 
 #include <vector>
 
-SfxDef fit_sfx_from_samples(const std::vector<float>& samples, int sample_rate);
+SfxDef fit_sfx_from_samples(const std::vector<float>& samples, int sample_rate, float source_match, float fidelity_boost);
