@@ -1,6 +1,8 @@
 #include "json_exporter.hpp"
 #include "sfx_def.hpp"
+#include "sfx_importer.hpp"
 #include "synth_engine.hpp"
+#include "wav_reader.hpp"
 #include "wav_writer.hpp"
 
 #include "imgui.h"
@@ -10,10 +12,12 @@
 #include <GL/glut.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -31,6 +35,7 @@ struct AppState {
     std::vector<float> preview_samples;
     RenderDebugData debug_data;
     float ui_font_scale = kUiFontScale;
+    std::string import_path = "";
 
     std::vector<SfxDef> undo_stack;
     std::vector<SfxDef> redo_stack;
@@ -155,6 +160,162 @@ void save_exports() {
         g_app.status = "Saved JSON + WAV";
     } else {
         g_app.status = "Save failed";
+    }
+}
+
+std::string shell_quote(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 8);
+    out.push_back('\'');
+    for (char c : value) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('\'');
+    return out;
+}
+
+bool command_exists(const char* cmd) {
+    std::ostringstream oss;
+    oss << "command -v " << cmd << " >/dev/null 2>&1";
+    return std::system(oss.str().c_str()) == 0;
+}
+
+std::filesystem::path resolve_import_path(const std::string& raw_path) {
+    std::filesystem::path p(raw_path);
+    if (std::filesystem::exists(p)) {
+        return p;
+    }
+
+    if (p.is_relative()) {
+        const std::filesystem::path in_imports = std::filesystem::path("imports") / p;
+        if (std::filesystem::exists(in_imports)) {
+            return in_imports;
+        }
+    }
+
+    const std::string typo_prefix = "imprts/";
+    if (raw_path.rfind(typo_prefix, 0) == 0) {
+        const std::filesystem::path fixed = std::string("imports/") + raw_path.substr(typo_prefix.size());
+        if (std::filesystem::exists(fixed)) {
+            return fixed;
+        }
+    }
+
+    return p;
+}
+
+void browse_import_file() {
+    if (!command_exists("zenity")) {
+        g_app.status = "Browse unavailable: install zenity or paste path manually";
+        return;
+    }
+
+    const char* picker_cmd =
+        "zenity --file-selection --title='Select Audio File' "
+        "--file-filter='Audio files | *.wav *.WAV *.mp3 *.MP3' "
+        "--file-filter='All files | *'";
+
+    FILE* pipe = popen(picker_cmd, "r");
+    if (!pipe) {
+        g_app.status = "Failed to open file picker";
+        return;
+    }
+
+    char buffer[1024] = {};
+    std::string selected;
+    if (fgets(buffer, static_cast<int>(sizeof(buffer)), pipe) != nullptr) {
+        selected = buffer;
+        while (!selected.empty() && (selected.back() == '\n' || selected.back() == '\r')) {
+            selected.pop_back();
+        }
+    }
+    const int rc = pclose(pipe);
+
+    if (rc == 0 && !selected.empty()) {
+        g_app.import_path = selected;
+        g_app.status = "Selected import file";
+    } else {
+        g_app.status = "Import selection cancelled";
+    }
+}
+
+void import_audio_to_sfx() {
+    if (g_app.import_path.empty()) {
+        g_app.status = "Import path is empty";
+        return;
+    }
+
+    std::filesystem::path source_path = resolve_import_path(g_app.import_path);
+    if (!std::filesystem::exists(source_path)) {
+        g_app.status = "Import failed: file not found (try imports/<file>)";
+        return;
+    }
+
+    std::string ext = source_path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    std::filesystem::path wav_path = source_path;
+    std::filesystem::path temp_wav;
+    if (ext == ".mp3") {
+        if (!command_exists("ffmpeg")) {
+            g_app.status = "Import failed: MP3 needs ffmpeg (sudo apt install ffmpeg)";
+            return;
+        }
+
+        std::filesystem::create_directories("exports");
+        temp_wav = std::filesystem::path("exports") / ".import_temp.wav";
+        std::ostringstream cmd;
+        cmd << "ffmpeg -y -v error -i " << shell_quote(source_path.string())
+            << " -ac 1 -ar 44100 " << shell_quote(temp_wav.string());
+        const int rc = std::system(cmd.str().c_str());
+        if (rc != 0 || !std::filesystem::exists(temp_wav)) {
+            g_app.status = "Import failed: ffmpeg conversion error";
+            return;
+        }
+        wav_path = temp_wav;
+    } else if (ext != ".wav") {
+        g_app.status = "Import failed: only WAV/MP3 supported";
+        return;
+    }
+
+    WavData wav;
+    std::string error;
+    if (!read_wav_file(wav_path.string(), wav, error)) {
+        g_app.status = "Import failed: " + error;
+        if (!temp_wav.empty()) {
+            std::error_code remove_ec;
+            std::filesystem::remove(temp_wav, remove_ec);
+        }
+        return;
+    }
+    if (wav.samples.empty()) {
+        g_app.status = "Import failed: no sample data";
+        if (!temp_wav.empty()) {
+            std::error_code remove_ec;
+            std::filesystem::remove(temp_wav, remove_ec);
+        }
+        return;
+    }
+
+    push_history();
+    g_app.current = fit_sfx_from_samples(wav.samples, wav.sample_rate);
+
+    std::filesystem::path p(source_path);
+    if (p.has_stem()) {
+        g_app.current_name = p.stem().string();
+    }
+    g_app.status = "Imported audio -> fitted SfxDef";
+    rerender_preview();
+
+    if (!temp_wav.empty()) {
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_wav, remove_ec);
     }
 }
 
@@ -342,6 +503,19 @@ void display_callback() {
     }
     if (ImGui::SliderFloat("UI Scale", &g_app.ui_font_scale, 1.0f, 2.5f, "%.2fx")) {
         ImGui::GetIO().FontGlobalScale = g_app.ui_font_scale;
+    }
+
+    char import_buf[512];
+    std::snprintf(import_buf, sizeof(import_buf), "%s", g_app.import_path.c_str());
+    if (ImGui::InputText("Import WAV Path", import_buf, sizeof(import_buf))) {
+        g_app.import_path = import_buf;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...")) {
+        browse_import_file();
+    }
+    if (ImGui::Button("Import WAV/MP3 -> Fit SfxDef")) {
+        import_audio_to_sfx();
     }
 
     if (ImGui::Button("Play (SPACE)")) {

@@ -11,6 +11,7 @@ Standalone sound effect designer for your game pipeline.
 - Live plots: envelope, frequency trajectory, output waveform
 - JSON export compatible with `SfxDef`
 - WAV export with configurable duration
+- WAV/MP3 import with best-effort fitting into `SfxDef` constraints
 
 ## Build Dependencies (Linux)
 
@@ -58,4 +59,6 @@ make
 
 - Playback uses `aplay` when available.
 - Exported files are written under `exports/`.
+- Use `Import WAV Path` + `Browse...` + `Import WAV/MP3 -> Fit SfxDef` to convert external audio into editable `SfxDef` values.
+- `zenity` enables GUI file browse on Linux, and `ffmpeg` enables MP3 conversion.
 - This is the first incremental implementation and is structured for fast iteration.

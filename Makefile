@@ -8,6 +8,8 @@ SRC := \
 	src/sfx_def.cpp \
 	src/synth_engine.cpp \
 	src/wav_writer.cpp \
+	src/wav_reader.cpp \
+	src/sfx_importer.cpp \
 	src/json_exporter.cpp \
 	third_party/imgui/imgui.cpp \
 	third_party/imgui/imgui_draw.cpp \
